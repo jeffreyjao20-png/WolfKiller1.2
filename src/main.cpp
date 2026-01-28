@@ -1,0 +1,655 @@
+/*
+ * =============================================================
+ * 狼人殺控制系統 (Werewolf Controller) - V1.3.0 Full Expansion
+ * -------------------------------------------------------------
+ * 1. 角色新增：獵人(Hunter)、守衛(Guard)、白痴(Idiot)
+ * 2. 規則擴充：同守同救死亡、獵人毒死禁射、白痴翻牌機制
+ * 3. 優化：動態角色分配 (6-15人)
+ * =============================================================
+ */
+
+#include <WiFi.h>
+#include <AsyncTCP.h>
+#include <ESPAsyncWebServer.h>
+#include <DNSServer.h>
+#include <Wire.h>
+#include <U8g2lib.h>
+#include <ArduinoJson.h>
+#include <DFRobotDFPlayerMini.h>
+#include <map>
+#include <vector>
+#include <set>
+
+// --- 硬體引腳 ---
+#define OLED_SDA      21
+#define OLED_SCL      22
+#define JOYSTICK_X    36/*  */
+#define JOYSTICK_SW    4
+#define BELL_PIN      14
+#define DF_BUSY_PIN   18 
+
+// --- 物件實例 ---
+HardwareSerial dfSerial(2); 
+DFRobotDFPlayerMini myDFPlayer;
+U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, -1);
+DNSServer dnsServer;
+AsyncWebServer server(80);
+AsyncWebSocket ws("/ws");
+
+// --- 網路設定 ---
+IPAddress apIP(192, 168, 4, 1);
+const byte DNS_PORT = 53;
+
+// --- 遊戲變數 ---
+std::map<String, String> playerRoleMap;      
+std::map<String, int> playerIndexMap;        
+std::map<uint32_t, String> clientIdToDeviceId; 
+std::vector<String> deadPlayers;             
+std::set<String> restartVotes;               
+
+int targetPlayerCount = 7;                   
+int currentPlayerCount = 0;                  
+bool gameStarted = false;                    
+bool isStartingCountdown = false;            
+unsigned long countdownStartTime = 0;
+bool confirmPressed = false;                 
+bool gameOver = false;                       
+bool adminApprovedReset = false;             
+String winner = "NONE";                      
+
+int nightPhase = -1;      // -1:等待, 4:守衛, 0:狼人, 1:預言家, 2:女巫, 3:白天
+int roundCount = 1;       
+String wolfTargetId = ""; 
+String witchPoisonId = "";
+bool witchHasHeal = true; 
+bool witchHasPoison = true;
+
+// --- 新角色變數 ---
+String lastGuardedId = "";    // 守衛上一晚守的人
+String currentGuardedId = ""; // 守衛今晚守的人
+bool hunterCanShoot = true;   // 獵人是否有子彈
+bool idiotRevealed = false;   // 白痴是否已翻牌免死
+String idiotId = "";          // 記錄誰是白痴
+
+unsigned long phaseStartTime = 0;            
+bool isPhaseLocked = false; 
+unsigned long seerCheckDelayStart = 0;  
+bool isSeerCheckPending = false;        
+unsigned long audioPlayStartTime = 0;    
+bool isAudioPlaying = false;             
+
+// --- V1.4 新增變數 ---
+bool hunterActionPending = false; // 是否正在等待獵人行動
+unsigned long phaseDelayStartTime = 0; // 用於已死亡神職的假性延遲
+
+
+void playVoice(int fileID, bool wait) {
+    Serial.printf("Audio: Playing #%d\n", fileID);
+    myDFPlayer.play(fileID);
+    delay(50); // Add a small delay for command stability
+    audioPlayStartTime = millis();  
+    isAudioPlaying = wait;          
+}
+
+void triggerBuzzer(int type) {
+    if (type == 1) tone(BELL_PIN, 1000, 100); 
+    if (type == 2) tone(BELL_PIN, 800, 500);  
+}
+
+bool isAlive(String id) {
+    for (String d : deadPlayers) { if (d == id) return false; }
+    return true;
+}
+
+bool isRoleAlive(String roleName) {
+    for (auto const& p : playerRoleMap) {
+        if (p.second == roleName && isAlive(p.first)) return true;
+    }
+    return false;
+}
+
+void checkVictory() {
+    if (!gameStarted || isStartingCountdown || gameOver) return;
+    int wolves = 0, humans = 0;
+    for (auto const& p : playerRoleMap) {
+        if (!isAlive(p.first)) continue; 
+        if (p.second == "狼人") wolves++;
+        else if (p.second != "Joined" && p.second != "旁觀者") humans++;
+    }
+    if (wolves == 0) { gameOver = true; winner = "HUMANS"; }
+    else if (wolves >= humans) { gameOver = true; winner = "WOLVES"; }
+}
+
+void setupRoles() {
+    int seq = 1;
+    idiotId = ""; idiotRevealed = false; hunterCanShoot = true;
+    for (auto &p : playerRoleMap) if (p.second != "旁觀者") playerIndexMap[p.first] = seq++;
+    
+    // 動態配制角色池
+    std::vector<String> rPool = {"狼人", "狼人", "預言家", "女巫"};
+    if(targetPlayerCount >= 7) rPool.push_back("獵人");
+    if(targetPlayerCount >= 9) rPool.push_back("狼人");
+    if(targetPlayerCount >= 10) rPool.push_back("守衛");
+    if(targetPlayerCount >= 12) rPool.push_back("狼人");
+    if(targetPlayerCount >= 13) rPool.push_back("白痴");
+    
+    while(rPool.size() < (size_t)targetPlayerCount) rPool.push_back("平民");
+    
+    // 洗牌
+    for(int i = rPool.size() - 1; i > 0; i--) { 
+        int j = random(0, i + 1); String t = rPool[i]; rPool[i] = rPool[j]; rPool[j] = t; 
+    }
+    
+    int rIdx = 0;
+    for (auto &p : playerRoleMap) {
+        if (p.second != "旁觀者") {
+            p.second = rPool[rIdx++];
+            if(p.second == "白痴") idiotId = p.first;
+        }
+    }
+}
+
+void resetGame() {
+    Serial.println("DEBUG: resetGame() called.");
+    gameStarted = false; gameOver = false; isStartingCountdown = false; 
+    adminApprovedReset = false; winner = "NONE";
+    nightPhase = -1; 
+    roundCount = 1;
+    deadPlayers.clear(); restartVotes.clear(); confirmPressed = false;
+    for (auto &p : playerRoleMap) { if (p.second != "旁觀者") p.second = "Joined"; }
+    wolfTargetId = ""; witchPoisonId = ""; witchHasHeal = true; witchHasPoison = true;
+    lastGuardedId = ""; currentGuardedId = ""; hunterCanShoot = true; idiotRevealed = false;
+    isPhaseLocked = false; isSeerCheckPending = false;
+}
+
+// --- WebSocket 處理 ---
+
+void syncGameState() {
+    checkVictory();
+    
+    // 自動跳過無人職位 (V1.4 - 增加延遲)
+    if (gameStarted && !gameOver && !isPhaseLocked && phaseDelayStartTime == 0 && !hunterActionPending) {
+        if ((nightPhase == 4 && !isRoleAlive("守衛")) ||
+            (nightPhase == 1 && !isRoleAlive("預言家")) ||
+            (nightPhase == 2 && !isRoleAlive("女巫"))) {
+            phaseDelayStartTime = millis();
+            isPhaseLocked = true; // 鎖定介面，顯示「天黑請閉眼」
+        }
+    }
+
+    DynamicJsonDocument targetDoc(2048);
+    JsonArray targets = targetDoc.to<JsonArray>();
+    for (auto const& p : playerIndexMap) {
+        if (isAlive(p.first)) {
+            JsonObject obj = targets.createNestedObject();
+            obj["id"] = p.first; obj["index"] = p.second;
+        }
+    }
+
+    int cdSec = (isStartingCountdown) ? max(0, (int)(3 - (millis() - countdownStartTime) / 1000)) : 0;
+
+    for (auto const& cp : clientIdToDeviceId) {
+        DynamicJsonDocument m(3000);
+        String devId = cp.second;
+        m["type"] = "update";
+        m["role"] = playerRoleMap[devId];
+        m["index"] = playerIndexMap[devId];
+        m["isDead"] = !isAlive(devId);
+        m["phase"] = nightPhase;
+        m["gameOver"] = gameOver;
+        m["winner"] = winner;
+        m["adminApproved"] = adminApprovedReset;
+        m["targets"] = targets;
+        m["isPhaseLocked"] = isPhaseLocked || hunterActionPending; 
+        m["hunterActionPending"] = hunterActionPending;
+        m["countdown"] = cdSec;
+        m["isStarting"] = isStartingCountdown;
+        m["idiotRevealed"] = (devId == idiotId && idiotRevealed);
+
+        // 獵人開槍判斷
+        m["canShoot"] = (playerRoleMap[devId] == "獵人" && !isAlive(devId) && hunterCanShoot);
+        
+        if (nightPhase == 3) {
+            String deaths = "";
+            for(auto const& d : deadPlayers) { // 此處僅顯示昨晚死的人 (簡化邏輯)
+                // 實務上需紀錄哪一晚死，此處僅供參考
+            }
+            m["deathNote"] = (wolfTargetId == "" && witchPoisonId == "") ? "平安夜" : "昨晚有人倒下";
+        }
+        
+        if (nightPhase == 4 && playerRoleMap[devId] == "守衛") m["lastGuardedId"] = lastGuardedId;
+        if (nightPhase == 2 && playerRoleMap[devId] == "女巫") {
+            m["hasHeal"] = witchHasHeal; m["hasPoison"] = witchHasPoison;
+            m["wolfTargetIndex"] = (wolfTargetId != "") ? playerIndexMap[wolfTargetId] : 0;
+            m["wolfTargetId"] = wolfTargetId;
+        }
+        
+        String out; serializeJson(m, out);
+        ws.text(cp.first, out);
+    }
+
+    // OLED 顯示
+    u8g2.clearBuffer();
+    if (isStartingCountdown) {
+        u8g2.drawStr(0, 20, "READYING...");
+        u8g2.setCursor(60, 50); u8g2.print(cdSec);
+    } else if (gameOver) {
+        u8g2.drawStr(0, 15, "GAME OVER!");
+        u8g2.setCursor(0, 35); u8g2.print("Win: "); u8g2.print(winner);
+        if (adminApprovedReset) {
+            u8g2.drawStr(0, 55, "Ready: ");
+            u8g2.setCursor(70, 55); u8g2.print(restartVotes.size());
+            u8g2.print("/"); u8g2.print(targetPlayerCount);
+        } else {
+            u8g2.drawStr(0, 55, "> PRESS SW <");
+        }
+    } else if (!gameStarted) {
+        u8g2.drawStr(0, 20, "SET PLAYER:"); u8g2.setCursor(70, 20); u8g2.print(targetPlayerCount);
+        u8g2.setCursor(0, 50); u8g2.print("Joined: "); u8g2.print(currentPlayerCount);
+    } else {
+        u8g2.setCursor(0, 15); u8g2.print("Day: "); u8g2.print(roundCount);
+        String pName = "UNKNOWN";
+        if(nightPhase==4) pName = "GUARD ACTING";
+        else if(nightPhase==0) pName = "WOLF ACTING";
+        else if(nightPhase==1) pName = "SEER ACTING";
+        else if(nightPhase==2) pName = "WITCH ACTING";
+        else pName = "VOTING TIME";
+        u8g2.drawStr(0, 40, pName.c_str());
+    }
+    u8g2.sendBuffer();
+}
+
+void onWsEvent(AsyncWebSocket *s, AsyncWebSocketClient *c, AwsEventType t, void *arg, uint8_t *d, size_t l){
+    if(t!=WS_EVT_DATA) return;
+    DynamicJsonDocument doc(1024);
+    deserializeJson(doc,(char*)d,l);
+    String action=doc["action"];
+    String devId=doc["deviceId"];
+
+    if(action=="connect"){
+        clientIdToDeviceId[c->id()]=devId;
+        if(!playerRoleMap.count(devId)){
+            playerRoleMap[devId]=gameStarted?"旁觀者":"Joined";
+            currentPlayerCount++;
+        }
+        syncGameState();
+    }
+    else if(action=="restart"){
+        if (adminApprovedReset) { // 僅在GM同意後才接受續局投票
+            restartVotes.insert(devId);
+            if(restartVotes.size() >= (size_t)targetPlayerCount){
+                // 人數到齊，自動開局
+                resetGame(); 
+                setupRoles(); 
+                isStartingCountdown = true; 
+                countdownStartTime = millis(); 
+                triggerBuzzer(2);
+            }
+        }
+        syncGameState();
+    }
+    else if (action == "guardProtect") {
+        currentGuardedId = doc["targetId"].as<String>();
+        lastGuardedId = currentGuardedId; // 更新禁守紀錄
+        playVoice(13, true); // 守衛閉眼
+        nightPhase = 0; phaseStartTime = millis(); isPhaseLocked = true; syncGameState();
+    }
+    else if (action == "wolfKill") {
+        wolfTargetId = doc["targetId"].as<String>();
+        playVoice(3, true); 
+        nightPhase = 1; phaseStartTime = millis(); isPhaseLocked = true; syncGameState();
+    }
+    else if (action == "seerCheck") {
+        String tRole = playerRoleMap[doc["targetId"].as<String>()];
+        c->text("{\"type\":\"seerResult\", \"role\":\"" + tRole + "\"}");
+        isSeerCheckPending = true; seerCheckDelayStart = millis();
+    }
+    else if (action == "witchHeal" || action == "witchPoison" || action == "witchSkip") {
+        bool healed = false;
+        if(action == "witchHeal") { 
+            witchHasHeal = false; healed = true; 
+        } else if(action == "witchPoison") { 
+            witchHasPoison = false; 
+            witchPoisonId = doc["targetId"].as<String>(); 
+            if(playerRoleMap[witchPoisonId] == "獵人") hunterCanShoot = false; // 毒殺不能開槍
+        }
+        
+        // V1.4 - 結算死亡並檢查獵人
+        std::vector<String> newly_dead;
+        if (healed) {
+            if (wolfTargetId == currentGuardedId) newly_dead.push_back(wolfTargetId); // 同守同救 -> 死
+        } else {
+            if (wolfTargetId != "" && wolfTargetId != currentGuardedId) newly_dead.push_back(wolfTargetId);
+        }
+        if (witchPoisonId != "") newly_dead.push_back(witchPoisonId);
+
+        bool hunterDiedThisNight = false;
+        for(String id : newly_dead) {
+            deadPlayers.push_back(id);
+            if(playerRoleMap[id] == "獵人" && hunterCanShoot) {
+                hunterDiedThisNight = true;
+            }
+        }
+
+        playVoice(8, true); // 女巫閉眼
+        
+        if(hunterDiedThisNight) {
+            hunterActionPending = true;
+            isPhaseLocked = true; // 鎖定UI，等待獵人行動
+        } else {
+            nightPhase = 3; // 正常進入白天
+            phaseStartTime = millis(); 
+            isPhaseLocked = true;
+        }
+        syncGameState();
+    }
+    else if (action == "champExile") {
+        String exId = doc["targetId"].as<String>();
+        bool hunterExiled = false;
+
+        if (exId != "") {
+            if (exId == idiotId && !idiotRevealed) {
+                idiotRevealed = true; // 白痴翻牌免死
+            } else {
+                deadPlayers.push_back(exId);
+                if (playerRoleMap[exId] == "獵人" && hunterCanShoot) {
+                    hunterExiled = true;
+                }
+            }
+        }
+        
+        if (hunterExiled) {
+            hunterActionPending = true;
+            isPhaseLocked = true; // 鎖定UI，等待獵人
+        } else {
+            wolfTargetId = ""; witchPoisonId = ""; currentGuardedId = "";
+            nightPhase = 4; roundCount++; // 進入下一晚
+            phaseStartTime = millis(); isPhaseLocked = true;
+        }
+        syncGameState();
+    }
+    else if (action == "hunterShoot") {
+        String shotId = doc["targetId"].as<String>();
+        if (shotId != "") {
+            deadPlayers.push_back(shotId);
+        }
+        hunterCanShoot = false;
+        triggerBuzzer(2);
+
+        if(hunterActionPending) {
+            hunterActionPending = false;
+            // 判斷獵人死亡的時間點以決定下一階段
+            if(nightPhase == 3) { // 獵人在白天被投票出局
+                wolfTargetId = ""; witchPoisonId = ""; currentGuardedId = "";
+                nightPhase = 4; roundCount++; // 進入新的一晚
+                phaseStartTime = millis(); isPhaseLocked = true;
+            } else { // 獵人在晚上死亡 (可能是 守/狼/預/巫 階段)
+                nightPhase = 3; // 進入白天階段
+                phaseStartTime = millis(); isPhaseLocked = true;
+            }
+        }
+        syncGameState();
+    }
+}
+
+// --- 程式入口 ---
+
+void setup() {
+    Serial.begin(115200);
+    dfSerial.begin(9600, SERIAL_8N1, 16, 17);
+    
+    pinMode(BELL_PIN, OUTPUT); 
+    pinMode(JOYSTICK_SW, INPUT_PULLUP);
+    pinMode(DF_BUSY_PIN, INPUT_PULLUP); 
+
+    Wire.begin(OLED_SDA, OLED_SCL); 
+    u8g2.begin(); u8g2.setFont(u8g2_font_6x10_tf);
+
+    if (!myDFPlayer.begin(dfSerial)) {
+        Serial.println("DF Error");
+    } else {
+        myDFPlayer.volume(25);
+        myDFPlayer.reset(); // Reset the player to a known state
+    }
+
+    WiFi.mode(WIFI_AP);
+    WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
+    WiFi.softAP("Werewolf_V130", "12345678", 1, 0, 15); // 支援到 15 人
+    dnsServer.start(DNS_PORT, "*", apIP);
+    ws.onEvent(onWsEvent); server.addHandler(&ws);
+
+    server.on("/generate_204", [](AsyncWebServerRequest *r){ r->redirect("http://192.168.4.1"); });
+    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
+        String html = R"rawliteral(
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>狼人殺 V1.4</title><style>
+body { font-family: sans-serif; background: #121212; color: white; text-align: center; margin: 0; padding: 10px; }
+.card { background: #1e1e1e; padding: 20px; border-radius: 15px; max-width: 400px; margin: 10px auto; border: 1px solid #333; }
+button { background: #2563eb; color: white; border: none; padding: 15px; border-radius: 10px; margin: 8px 0; width: 100%; font-size: 16px; font-weight: bold; }
+button:disabled { background: #555; }
+.hunter { background: #b91c1c; border: 2px solid white; }
+.hide { display: none; } .info { color: #facc15; }
+</style></head><body>
+<div class="card">
+    <div id="gameUI">
+        <h2 id="title">遊戲大廳</h2>
+        <div id="roleDisplay" style="color:#facc15; font-size:22px; font-weight:bold;"></div>
+        <div id="status" class="info"></div>
+        <div id="actions"></div>
+        <div id="hunterZone" class="hide">
+            <h3 style="color:#ef4444">⚠️ 獵人開槍技能</h3>
+            <div id="hunterActions"></div>
+        </div>
+    </div>
+    <div id="winUI" class="hide">
+        <h1 id="winMsg"></h1>
+        <button id="restartBtn">下一局準備</button>
+    </div>
+</div>
+<script>
+    let deviceId = localStorage.getItem('wid') || 'P' + Math.floor(Math.random()*1000000);
+    localStorage.setItem('wid', deviceId);
+    let ws = new WebSocket('ws://' + window.location.hostname + '/ws');
+    ws.onopen = () => ws.send(JSON.stringify({ action: "connect", deviceId: deviceId }));
+    ws.onmessage = (e) => {
+        const d = JSON.parse(e.data);
+        if (d.type === "seerResult") { alert("🔮 查驗結果：【" + d.role + "】"); return; }
+        
+        const gameUI = document.getElementById('gameUI');
+        const winUI = document.getElementById('winUI');
+        const restartBtn = document.getElementById('restartBtn');
+
+        if (d.gameOver) {
+            gameUI.classList.add('hide');
+            winUI.classList.remove('hide');
+            document.getElementById('winMsg').innerHTML = (d.winner === "WOLVES" ? "狼人" : "好人") + "獲勝";
+            
+            if (d.adminApproved) {
+                restartBtn.innerHTML = '點此準備下一局';
+                restartBtn.disabled = false;
+                restartBtn.onclick = () => {
+                    act('restart', '');
+                    restartBtn.innerHTML = '已準備，等待其他玩家...';
+                    restartBtn.disabled = true;
+                };
+            } else {
+                restartBtn.innerHTML = '遊戲結束 (等待主控)';
+                restartBtn.disabled = true;
+            }
+            return;
+        }
+
+        if (gameUI.classList.contains('hide')) {
+            gameUI.classList.remove('hide');
+            winUI.classList.add('hide');
+        }
+        render(d);
+    };
+
+    function render(d) {
+        const area = document.getElementById('actions');
+        const hZone = document.getElementById('hunterZone');
+        const hActions = document.getElementById('hunterActions');
+        area.innerHTML = ""; hActions.innerHTML = ""; hZone.classList.add('hide');
+        document.getElementById('roleDisplay').innerHTML = d.role + " (" + d.index + "號)";
+
+        if (d.isDead) {
+            document.getElementById('status').innerHTML = d.idiotRevealed ? "你已翻牌免死 (無投票權)" : "你已出局";
+            if (d.canShoot) {
+                hZone.classList.remove('hide');
+                d.targets.forEach(t => hActions.innerHTML += `<button class="hunter" onclick="act('hunterShoot','${t.id}')">射殺 ${t.index}號</button>`);
+            }
+            if (!d.idiotRevealed) return; 
+        }
+
+        if (d.isPhaseLocked && !d.hunterActionPending) { area.innerHTML = "🌙 天黑請閉眼..."; return; }
+        if (d.hunterActionPending) { area.innerHTML = "等待獵人行動..."; return; }
+
+
+        if (d.phase == 4 && d.role === "守衛") {
+            d.targets.forEach(t => {
+                if(t.id != d.lastGuardedId) area.innerHTML += `<button onclick="act('guardProtect','${t.id}')">守護 ${t.index}號</button>`;
+            });
+            area.innerHTML += `<button onclick="act('guardProtect','')">空守</button>`;
+        } else if (d.phase == 0 && d.role === "狼人") {
+            d.targets.forEach(t => area.innerHTML += `<button onclick="act('wolfKill','${t.id}')">獵殺 ${t.index}號</button>`);
+        } else if (d.phase == 1 && d.role === "預言家") {
+            d.targets.forEach(t => { if(t.index != d.index) area.innerHTML += `<button onclick="act('seerCheck','${t.id}')">查驗 ${t.index}號</button>`; });
+        } else if (d.phase == 2 && d.role === "女巫") {
+            if (d.hasHeal && d.wolfTargetIndex) area.innerHTML += `<button style="background:#16a34a" onclick="act('witchHeal','${d.wolfTargetId}')">救 ${d.wolfTargetIndex}號</button>`;
+            if (d.hasPoison) d.targets.forEach(t => area.innerHTML += `<button style="background:#dc2626" onclick="act('witchPoison','${t.id}')">毒殺 ${t.index}號</button>`);
+            area.innerHTML += `<button onclick="act('witchSkip','')">跳過</button>`;
+        } else if (d.phase == 3) {
+            if (!d.idiotRevealed) {
+                d.targets.forEach(t => area.innerHTML += `<button onclick="act('champExile','${t.id}')">放逐 ${t.index}號</button>`);
+                area.innerHTML += `<button onclick="act('champExile','')">棄票</button>`;
+            } else {
+                area.innerHTML = "你已翻牌，無法參與投票";
+            }
+        }
+    }
+    function act(a, t) { ws.send(JSON.stringify({ action: a, targetId: t, deviceId: deviceId })); }
+</script></body></html>
+)rawliteral";
+        request->send(200, "text/html", html);
+    });
+    server.begin();
+    // --- 強制初始化顯示設定畫面 ---
+    gameStarted = false;
+    isStartingCountdown = false;
+    confirmPressed = false; 
+    
+    u8g2.clearBuffer();
+    syncGameState(); // 確保開機第一時間顯示 SET PLAYER 畫面
+}
+
+void loop() {
+    dnsServer.processNextRequest();
+    ws.cleanupClients();
+
+    // --- V1.4 新增：處理神職死亡延遲 ---
+    if (phaseDelayStartTime > 0 && (millis() - phaseDelayStartTime) >= 3000) { // 延遲3秒
+        int currentPhase = nightPhase;
+        phaseDelayStartTime = 0; // 清除計時器
+
+        if (currentPhase == 4) { // 守衛死亡 -> 跳到狼人
+            nightPhase = 0; 
+        } else if (currentPhase == 1) { // 預言家死亡 -> 跳到女巫
+            nightPhase = 2;
+        } else if (currentPhase == 2) { // 女巫死亡 -> 結算狼刀並進入白天
+            if (wolfTargetId != "" && wolfTargetId != currentGuardedId) {
+                deadPlayers.push_back(wolfTargetId);
+            }
+            nightPhase = 3;
+        }
+        
+        phaseStartTime = millis();
+        syncGameState();
+    }
+    
+    // --- 1. 音效與非阻塞延遲處理 (維持原本 1.1.3/1.3.0 邏輯) ---
+    if (isAudioPlaying && digitalRead(DF_BUSY_PIN) == LOW) isAudioPlaying = false;
+    
+    if (isSeerCheckPending && (millis() - seerCheckDelayStart >= 3000)) {
+        isSeerCheckPending = false;
+        playVoice(5, true); 
+        nightPhase = 2; phaseStartTime = millis(); isPhaseLocked = true; syncGameState();
+    }
+
+    // --- 2. 遊戲進行中的狀態處理 ---
+    if (gameStarted && isPhaseLocked && (millis() - phaseStartTime >= 2000)) {
+        if (digitalRead(DF_BUSY_PIN) == HIGH) { 
+            if (nightPhase == 4) playVoice(12, false);
+            else if (nightPhase == 0) playVoice(2, false);
+            else if (nightPhase == 1) playVoice(4, false);
+            else if (nightPhase == 2) playVoice(6, false);
+            else if (nightPhase == 3) playVoice(9, true);
+            isPhaseLocked = false;
+            syncGameState();
+        }
+    }
+
+    // --- 3. 人數設定與開局觸發 (解決鎖定 14 人與不顯示畫面的重點) ---
+    if (!gameStarted && !isStartingCountdown) {
+        if (!confirmPressed) {
+            // 讀取搖桿並增加死區 (Deadzone) 判斷，避免數值浮動
+            int xVal = analogRead(JOYSTICK_X);
+            bool swBtn = (digitalRead(JOYSTICK_SW) == LOW);
+
+            if (xVal > 3600 && targetPlayerCount < 15) { 
+                targetPlayerCount++; 
+                triggerBuzzer(1); 
+                delay(200); // 增加延遲避免跳太快
+                syncGameState();
+            }
+            else if (xVal < 400 && targetPlayerCount > 6) { 
+                targetPlayerCount--; 
+                triggerBuzzer(1); 
+                delay(200); 
+                syncGameState();
+            }
+            
+            if (swBtn) { 
+                confirmPressed = true; 
+                triggerBuzzer(2); 
+                delay(500); 
+                syncGameState();
+            }
+        } 
+        // 只有在 confirmPressed 之後，才判斷人數是否達標開局
+        else if (currentPlayerCount >= targetPlayerCount) {
+            setupRoles(); 
+            isStartingCountdown = true;
+            countdownStartTime = millis(); 
+            triggerBuzzer(2);
+            syncGameState();
+        }
+
+        // 定時刷新（防止 WebSocket 更新導致畫面遺失）
+        static unsigned long lastOledRefresh = 0;
+        if (millis() - lastOledRefresh > 500) {
+            lastOledRefresh = millis();
+            syncGameState();
+        }
+    }
+
+    // --- 4. 倒數計時與結束處理 ---
+    if (isStartingCountdown && (millis() - countdownStartTime >= 4000)) {
+        isStartingCountdown = false; 
+        gameStarted = true; 
+        nightPhase = 4; // 進入守衛階段
+        playVoice(1, true); 
+        phaseStartTime = millis(); 
+        isPhaseLocked = true;
+        syncGameState();
+    }
+
+    if (gameOver && !adminApprovedReset && (digitalRead(JOYSTICK_SW) == LOW)) { 
+        adminApprovedReset = true;
+        restartVotes.clear();
+        delay(500); 
+        syncGameState();
+    }
+    
+    delay(10);
+}
