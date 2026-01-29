@@ -442,7 +442,7 @@ void onWsEvent(AsyncWebSocket *s, AsyncWebSocketClient *c, AwsEventType t, void 
                 // V1.7 BUGFIX: 增加阻塞延遲以確保槍聲音效能完整播放
                 // 在播放下一個"天黑"音效前，等待槍聲音效播放完畢或超時
                 unsigned long waitStart = millis();
-                while(digitalRead(DF_BUSY_PIN) == LOW && (millis() - waitStart < 2000)) { // 等待最多2秒
+                while(digitalRead(DF_BUSY_PIN) == LOW && (millis() - waitStart < 3500)) { // 等待最多2秒
                     delay(10);
                 }
 
