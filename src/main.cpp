@@ -182,6 +182,9 @@ void resetGame() {
 // --- WebSocket 處理 ---
 
 void syncGameState() {
+    // V1.8 Memory-Debug: 在每次同步狀態時印出剩餘記憶體，用於觀察記憶體洩漏或碎片化問題
+    Serial.printf("Sync State - Free Heap: %u bytes\n", ESP.getFreeHeap());
+
     checkVictory();
     
     // 自動跳過無人職位 (V1.4 - 增加延遲)
@@ -241,13 +244,17 @@ void syncGameState() {
         
         if (nightPhase == 3) {
             // V1.5: 產生昨晚死亡報告
-            String deathNoteStr = "";
+            // V1.8 Memory-Fix: 優化字串拼接以減少記憶體碎片。預先申請64位元組空間。
+            String deathNoteStr;
+            deathNoteStr.reserve(64); 
+
             if (lastNightDeadPlayers.empty()) {
                 deathNoteStr = "昨晚是平安夜。";
             } else {
                 deathNoteStr = "昨晚死亡的玩家是：";
                 for (size_t i = 0; i < lastNightDeadPlayers.size(); ++i) {
-                    deathNoteStr += String(playerIndexMap[lastNightDeadPlayers[i]]) + "號";
+                    deathNoteStr += playerIndexMap[lastNightDeadPlayers[i]];
+                    deathNoteStr += "號";
                     if (i < lastNightDeadPlayers.size() - 1) deathNoteStr += "、";
                 }
                 deathNoteStr += "。";
@@ -479,6 +486,10 @@ void setup() {
     u8g2.begin(); u8g2.setFont(u8g2_font_6x10_tf);
 
     if (!myDFPlayer.begin(dfSerial)) {
+        // V1.8 Memory-Debug: 在啟動時印出初始記憶體狀態
+        Serial.println("--- Initial State ---");
+        Serial.printf("Total Heap: %u bytes\n", ESP.getHeapSize());
+        Serial.printf("Free Heap: %u bytes\n", ESP.getFreeHeap());
         Serial.println("DF Error");
     } else {
         myDFPlayer.volume(25);
