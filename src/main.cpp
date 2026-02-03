@@ -11,6 +11,7 @@
 #include <WiFi.h>
 #include <AsyncTCP.h>
 #include <ESPAsyncWebServer.h>
+#include <LittleFS.h>
 #include <DNSServer.h>
 #include <Wire.h>
 #include <U8g2lib.h>
@@ -83,6 +84,12 @@ bool isAudioPlaying = false;
 bool hunterActionPending = false; // 是否正在等待獵人行動
 unsigned long phaseDelayStartTime = 0; // 用於已死亡神職的假性延遲
 
+// --- V1.9 Stability 新增變數 (非阻塞狀態機用) ---
+bool hunterTransitionPending = false;
+unsigned long hunterTransitionStart = 0;
+int godDeathState = 0; // 0:閒置, 1:等待音效結束
+unsigned long godDeathAudioStart = 0;
+int godDeathNextPhase = -1;
 
 void playVoice(int fileID, bool wait) {
     Serial.printf("Audio: Playing #%d\n", fileID);
@@ -354,7 +361,13 @@ void onWsEvent(AsyncWebSocket *s, AsyncWebSocketClient *c, AwsEventType t, void 
     else if (action == "seerCheck") {
         if (isSeerCheckPending) return; // V1.4 BUGFIX: 防止重複查驗
         String tRole = playerRoleMap[doc["targetId"].as<String>()];
-        c->text("{\"type\":\"seerResult\", \"role\":\"" + tRole + "\"}");
+        // V1.9 Stability-Fix: 使用 ArduinoJson 取代字串拼接，減少記憶體碎片
+        DynamicJsonDocument seerDoc(128);
+        seerDoc["type"] = "seerResult";
+        seerDoc["role"] = tRole;
+        String output;
+        serializeJson(seerDoc, output);
+        c->text(output);
         isSeerCheckPending = true; 
         seerCheckDelayStart = millis();
         isPhaseLocked = true; // V1.4 BUGFIX: 立即鎖定介面
@@ -446,23 +459,9 @@ void onWsEvent(AsyncWebSocket *s, AsyncWebSocketClient *c, AwsEventType t, void 
             hunterActionPending = false;
             // 判斷獵人死亡的時間點以決定下一階段
             if(nightPhase == 3) { // 獵人在白天被投票出局，準備進入新夜晚
-                // V1.7 BUGFIX: 增加阻塞延遲以確保槍聲音效能完整播放
-                // 在播放下一個"天黑"音效前，等待槍聲音效播放完畢或超時
-                unsigned long waitStart = millis();
-                while(digitalRead(DF_BUSY_PIN) == LOW && (millis() - waitStart < 3500)) { // 等待最多2秒
-                    delay(10);
-                }
-
-                wolfTargetId = ""; witchPoisonId = ""; currentGuardedId = ""; lastNightDeadPlayers.clear(); // V1.5: 進入新夜晚，清空死者名單
-                playVoice(1, true); // V1.4 BUGFIX: 進入新夜晚時播放天黑音效
-                // V1.4 MOD: 根據守衛是否存在決定下一晚的起始
-                if (isRoleAlive("守衛")) {
-                    nightPhase = 4;
-                } else {
-                    nightPhase = 0;
-                }
-                roundCount++; // 進入新的一晚
-                phaseStartTime = millis(); isPhaseLocked = true;
+                // V1.9 Stability: 改為非阻塞標記，移至 loop() 處理，避免卡死網路
+                hunterTransitionPending = true;
+                hunterTransitionStart = millis();
             } else { // 獵人在晚上死亡 (可能是 守/狼/預/巫 階段)
                 nightPhase = 3; // 進入白天階段
                 phaseStartTime = millis(); isPhaseLocked = true;
@@ -496,160 +495,23 @@ void setup() {
         myDFPlayer.reset(); // Reset the player to a known state
     }
 
+    // V1.9 Stability: 初始化 LittleFS
+    if(!LittleFS.begin(true)){
+        Serial.println("An Error has occurred while mounting LittleFS");
+        return;
+    }
+
     WiFi.mode(WIFI_AP);
     WiFi.softAPConfig(apIP, apIP, IPAddress(255, 255, 255, 0));
     WiFi.softAP("Werewolf_V130", "12345678", 1, 0, 15); // 支援到 15 人
+    WiFi.setSleep(false); // V1.9 Stability: 關閉 WiFi 省電模式，大幅提升連線穩定度與降低延遲
     dnsServer.start(DNS_PORT, "*", apIP);
     ws.onEvent(onWsEvent); server.addHandler(&ws);
 
     server.on("/generate_204", [](AsyncWebServerRequest *r){ r->redirect("http://192.168.4.1"); });
-    server.on("/", HTTP_GET, [](AsyncWebServerRequest *request) {
-        String html = R"rawliteral(
-<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>狼人殺 V1.4</title><style>
-body { font-family: sans-serif; background: #121212; color: white; text-align: center; margin: 0; padding: 10px; }
-.card { background: #1e1e1e; padding: 20px; border-radius: 15px; max-width: 400px; margin: 10px auto; border: 1px solid #333; }
-button { background: #2563eb; color: white; border: none; padding: 15px; border-radius: 10px; margin: 8px 0; width: 100%; font-size: 16px; font-weight: bold; }
-button:disabled { background: #555; }
-.hunter { background: #b91c1c; border: 2px solid white; }
-.hide { display: none; } .info { color: #facc15; }
-</style></head><body>
-<div class="card">
-    <div id="gameUI">
-        <h2 id="title">遊戲大廳</h2>
-        <div id="roleDisplay" style="color:#facc15; font-size:22px; font-weight:bold;"></div>
-        <div id="status" class="info"></div>
-        <div id="actions"></div>
-        <div id="hunterZone" class="hide">
-            <h3 style="color:#ef4444">⚠️ 獵人開槍技能</h3>
-            <div id="hunterActions"></div>
-        </div>
-    </div>
-    <div id="winUI" class="hide">
-        <h1 id="winMsg"></h1>
-        <button id="restartBtn">下一局準備</button>
-    </div>
-</div>
-<script>
-    let deviceId = localStorage.getItem('wid') || 'P' + Math.floor(Math.random()*1000000);
-    localStorage.setItem('wid', deviceId);
-    let ws = new WebSocket('ws://' + window.location.hostname + '/ws');
-    ws.onopen = () => ws.send(JSON.stringify({ action: "connect", deviceId: deviceId }));
-    ws.onmessage = (e) => {
-        const d = JSON.parse(e.data);
-        if (d.type === "seerResult") { alert("🔮 查驗結果：【" + d.role + "】"); return; }
-        
-        const gameUI = document.getElementById('gameUI');
-        const winUI = document.getElementById('winUI');
-        const restartBtn = document.getElementById('restartBtn');
-
-        if (d.gameOver) {
-            gameUI.classList.add('hide');
-            winUI.classList.remove('hide');
-            document.getElementById('winMsg').innerHTML = (d.winner === "WOLVES" ? "狼人" : "好人") + "獲勝";
-            
-            if (d.adminApproved) {
-                // V1.4 BUGFIX: 根據服務器狀態決定按鈕顯示
-                const hasVoted = d.votedPlayers && d.votedPlayers.includes(deviceId);
-                if (hasVoted) {
-                    restartBtn.innerHTML = '已準備，等待其他玩家...';
-                    restartBtn.disabled = true;
-                } else {
-                    restartBtn.innerHTML = '點此準備下一局';
-                    restartBtn.disabled = false;
-                    restartBtn.onclick = () => {
-                        act('restart', '');
-                    };
-                }
-            } else {
-                restartBtn.innerHTML = '遊戲結束 (等待主控)';
-                restartBtn.disabled = true;
-            }
-            return;
-        }
-
-        // V1.4 BUGFIX: 遊戲重新開始時，確保主介面顯示
-        if (gameUI.classList.contains('hide')) {
-            gameUI.classList.remove('hide');
-            winUI.classList.add('hide');
-        }
-        render(d);
-    };
-
-    function render(d) {
-        const area = document.getElementById('actions');
-        const hZone = document.getElementById('hunterZone');
-        const hActions = document.getElementById('hunterActions');
-        area.innerHTML = ""; hActions.innerHTML = ""; hZone.classList.add('hide');
-        document.getElementById('roleDisplay').innerHTML = d.role + " (" + d.index + "號)";
-        
-        let statusHtml = "";
-        // V1.5: 顯示昨晚死亡訊息
-        if (d.phase == 3 && d.deathNote) {
-            statusHtml += `<div class="info">${d.deathNote}</div>`;
-        }
-
-        // V1.4 BUGFIX: 顯示開局倒數
-        if (d.isStarting && d.countdown > 0) {
-            document.getElementById('title').innerHTML = "遊戲即將開始";
-            area.innerHTML = `<div style="font-size: 4em; font-weight: bold;">${d.countdown}</div>`;
-            document.getElementById('status').innerHTML = ""; // 倒數時清空狀態
-            return;
-        } 
-        // V1.6: 顯示等待玩家連線狀態 (Web)
-        else if (d.waitingForPlayers) {
-            document.getElementById('title').innerHTML = "等待玩家加入";
-            area.innerHTML = `<div style="font-size: 3em; font-weight: bold;">${d.currentCount} / ${d.targetCount}</div>`;
-            document.getElementById('status').innerHTML = "已確認人數，等待連線...";
-            return;
-        } else {
-            document.getElementById('title').innerHTML = "遊戲大廳";
-        }
-
-        if (d.isDead) {
-            let deadStatus = d.idiotRevealed ? "你已翻牌免死 (無投票權)" : "你已出局";
-            statusHtml += (statusHtml ? "<br>" : "") + deadStatus;
-            if (d.canShoot) {
-                hZone.classList.remove('hide');
-                d.targets.forEach(t => hActions.innerHTML += `<button class="hunter" onclick="act('hunterShoot','${t.id}')">射殺 ${t.index}號</button>`);
-            }
-            document.getElementById('status').innerHTML = statusHtml;
-            if (!d.idiotRevealed) return;
-        } else {
-            document.getElementById('status').innerHTML = statusHtml;
-        }
-        
-        if (d.isPhaseLocked && !d.hunterActionPending) { area.innerHTML = "🌙 天黑請閉眼..."; return; }
-        if (d.hunterActionPending) { area.innerHTML = "等待獵人行動..."; return; }
-
-
-        if (d.phase == 4 && d.role === "守衛") {
-            d.targets.forEach(t => {
-                if(t.id != d.lastGuardedId) area.innerHTML += `<button onclick="act('guardProtect','${t.id}')">守護 ${t.index}號</button>`;
-            });
-            area.innerHTML += `<button onclick="act('guardProtect','')">空守</button>`;
-        } else if (d.phase == 0 && d.role === "狼人") {
-            d.targets.forEach(t => area.innerHTML += `<button onclick="act('wolfKill','${t.id}')">獵殺 ${t.index}號</button>`);
-        } else if (d.phase == 1 && d.role === "預言家") {
-            d.targets.forEach(t => { if(t.index != d.index) area.innerHTML += `<button onclick="act('seerCheck','${t.id}')">查驗 ${t.index}號</button>`; });
-        } else if (d.phase == 2 && d.role === "女巫") {
-            if (d.hasHeal && d.wolfTargetIndex) area.innerHTML += `<button style="background:#16a34a" onclick="act('witchHeal','${d.wolfTargetId}')">救 ${d.wolfTargetIndex}號</button>`;
-            if (d.hasPoison) d.targets.forEach(t => area.innerHTML += `<button style="background:#dc2626" onclick="act('witchPoison','${t.id}')">毒殺 ${t.index}號</button>`);
-            area.innerHTML += `<button onclick="act('witchSkip','')">跳過</button>`;
-        } else if (d.phase == 3) {
-            if (!d.idiotRevealed) {
-                d.targets.forEach(t => area.innerHTML += `<button onclick="act('champExile','${t.id}')">放逐 ${t.index}號</button>`);
-                area.innerHTML += `<button onclick="act('champExile','')">棄票</button>`;
-            } else {
-                area.innerHTML = "你已翻牌，無法參與投票";
-            }
-        }
-    }
-    function act(a, t) { ws.send(JSON.stringify({ action: a, targetId: t, deviceId: deviceId })); }
-</script></body></html>
-)rawliteral";
-        request->send(200, "text/html", html);
-    });
+    // V1.9 Stability: 改為從 LittleFS 讀取 HTML，大幅減少 RAM 佔用
+    server.serveStatic("/", LittleFS, "/").setDefaultFile("index.html");
+    
     server.begin();
     // --- 強制初始化顯示設定畫面 ---
     gameStarted = false;
@@ -664,37 +526,69 @@ void loop() {
     dnsServer.processNextRequest();
     ws.cleanupClients();
 
-    // --- V1.4 新增：處理神職死亡延遲 (BUGFIX: 增加閉眼音效以完善假回合) ---
-    if (phaseDelayStartTime > 0 && (millis() - phaseDelayStartTime) >= 3000) { // 延遲3秒
-        int currentPhase = nightPhase;
-        phaseDelayStartTime = 0; // 清除計時器
-
-        unsigned long waitStart = 0; // 用於等待音效的超時計算
-
-        if (currentPhase == 4) { // 守衛死亡
-            playVoice(13, false); // 播放守衛閉眼
-            waitStart = millis();
-            while(digitalRead(DF_BUSY_PIN) == LOW && (millis() - waitStart < 5000)) { delay(10); } // 等待音效結束, 超時5秒
-            nightPhase = 0; 
-        } else if (currentPhase == 1) { // 預言家死亡
-            playVoice(5, false);  // 播放預言家閉眼
-            waitStart = millis();
-            while(digitalRead(DF_BUSY_PIN) == LOW && (millis() - waitStart < 5000)) { delay(10); }
-            nightPhase = 2;
-        } else if (currentPhase == 2) { // 女巫死亡
-            playVoice(8, false);  // 播放女巫閉眼
-            waitStart = millis();
-            while(digitalRead(DF_BUSY_PIN) == LOW && (millis() - waitStart < 5000)) { delay(10); }
-            if (wolfTargetId != "" && wolfTargetId != currentGuardedId) {
-                lastNightDeadPlayers.push_back(wolfTargetId); // V1.5: 記錄死者
-                deadPlayers.push_back(wolfTargetId);
+    // --- V1.9 Stability: 獵人開槍後的非阻塞轉場 ---
+    if (hunterTransitionPending) {
+        // 等待音效播放完畢 (BUSY PIN 為 HIGH 代表閒置) 或超時 3.5秒
+        if (digitalRead(DF_BUSY_PIN) == HIGH || (millis() - hunterTransitionStart > 3500)) {
+            hunterTransitionPending = false;
+            
+            wolfTargetId = ""; witchPoisonId = ""; currentGuardedId = ""; lastNightDeadPlayers.clear();
+            playVoice(1, true); // 播放天黑音效
+            
+            if (isRoleAlive("守衛")) {
+                nightPhase = 4;
+            } else {
+                nightPhase = 0;
             }
-            nightPhase = 3;
+            roundCount++; 
+            phaseStartTime = millis(); isPhaseLocked = true;
+            syncGameState();
+        }
+    }
+
+    // --- V1.9 Stability: 神職死亡延遲的非阻塞狀態機 ---
+    // 狀態 0: 等待初始 3秒 延遲
+    if (phaseDelayStartTime > 0 && godDeathState == 0) {
+        if ((millis() - phaseDelayStartTime) >= 3000) {
+            int currentPhase = nightPhase;
+            godDeathNextPhase = -1;
+
+            // V1.9 Stability: 修正重複的邏輯區塊與語法錯誤，使用非阻塞狀態機
+            if (currentPhase == 4) { // 守衛
+                playVoice(13, false); godDeathNextPhase = 0;
+            } else if (currentPhase == 1) { // 預言家
+                playVoice(5, false); godDeathNextPhase = 2;
+            } else if (currentPhase == 2) { // 女巫
+                playVoice(8, false); godDeathNextPhase = 3;
+                if (wolfTargetId != "" && wolfTargetId != currentGuardedId) {
+                    lastNightDeadPlayers.push_back(wolfTargetId);
+                    deadPlayers.push_back(wolfTargetId);
+                }
+            }
+
+            if (godDeathNextPhase != -1) {
+                godDeathState = 1; // 進入等待音效狀態
+                godDeathAudioStart = millis();
+            } else {
+                phaseDelayStartTime = 0; // 異常復位
+            }
         }
         
         phaseStartTime = millis();
         isPhaseLocked = true; // 確保能觸發下一階段的睜眼音效
         syncGameState();
+    }
+    // 狀態 1: 等待閉眼音效播放完畢
+    else if (godDeathState == 1) {
+        if (digitalRead(DF_BUSY_PIN) == HIGH || (millis() - godDeathAudioStart > 5000)) {
+            nightPhase = godDeathNextPhase;
+            godDeathState = 0;
+            phaseDelayStartTime = 0; // 完成流程，清除計時器
+            
+            phaseStartTime = millis();
+            isPhaseLocked = true;
+            syncGameState();
+        }
     }
     
     // --- 1. 音效與非阻塞延遲處理 (V1.4 BUGFIX: 修正 BUSY PIN 邏輯) ---

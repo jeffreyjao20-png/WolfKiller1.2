@@ -1,0 +1,137 @@
+<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>狼人殺 V1.4</title><style>
+body { font-family: sans-serif; background: #121212; color: white; text-align: center; margin: 0; padding: 10px; }
+.card { background: #1e1e1e; padding: 20px; border-radius: 15px; max-width: 400px; margin: 10px auto; border: 1px solid #333; }
+button { background: #2563eb; color: white; border: none; padding: 15px; border-radius: 10px; margin: 8px 0; width: 100%; font-size: 16px; font-weight: bold; }
+button:disabled { background: #555; }
+.hunter { background: #b91c1c; border: 2px solid white; }
+.hide { display: none; } .info { color: #facc15; }
+</style></head><body>
+<div class="card">
+    <div id="gameUI">
+        <h2 id="title">遊戲大廳</h2>
+        <div id="roleDisplay" style="color:#facc15; font-size:22px; font-weight:bold;"></div>
+        <div id="status" class="info"></div>
+        <div id="actions"></div>
+        <div id="hunterZone" class="hide">
+            <h3 style="color:#ef4444">⚠️ 獵人開槍技能</h3>
+            <div id="hunterActions"></div>
+        </div>
+    </div>
+    <div id="winUI" class="hide">
+        <h1 id="winMsg"></h1>
+        <button id="restartBtn">下一局準備</button>
+    </div>
+</div>
+<script>
+    let deviceId = localStorage.getItem('wid') || 'P' + Math.floor(Math.random()*1000000);
+    localStorage.setItem('wid', deviceId);
+    let ws = new WebSocket('ws://' + window.location.hostname + '/ws');
+    ws.onopen = () => ws.send(JSON.stringify({ action: "connect", deviceId: deviceId }));
+    ws.onmessage = (e) => {
+        const d = JSON.parse(e.data);
+        if (d.type === "seerResult") { alert("🔮 查驗結果：【" + d.role + "】"); return; }
+        
+        const gameUI = document.getElementById('gameUI');
+        const winUI = document.getElementById('winUI');
+        const restartBtn = document.getElementById('restartBtn');
+
+        if (d.gameOver) {
+            gameUI.classList.add('hide');
+            winUI.classList.remove('hide');
+            document.getElementById('winMsg').innerHTML = (d.winner === "WOLVES" ? "狼人" : "好人") + "獲勝";
+            
+            if (d.adminApproved) {
+                const hasVoted = d.votedPlayers && d.votedPlayers.includes(deviceId);
+                if (hasVoted) {
+                    restartBtn.innerHTML = '已準備，等待其他玩家...';
+                    restartBtn.disabled = true;
+                } else {
+                    restartBtn.innerHTML = '點此準備下一局';
+                    restartBtn.disabled = false;
+                    restartBtn.onclick = () => {
+                        act('restart', '');
+                    };
+                }
+            } else {
+                restartBtn.innerHTML = '遊戲結束 (等待主控)';
+                restartBtn.disabled = true;
+            }
+            return;
+        }
+
+        if (gameUI.classList.contains('hide')) {
+            gameUI.classList.remove('hide');
+            winUI.classList.add('hide');
+        }
+        render(d);
+    };
+
+    function render(d) {
+        const area = document.getElementById('actions');
+        const hZone = document.getElementById('hunterZone');
+        const hActions = document.getElementById('hunterActions');
+        area.innerHTML = ""; hActions.innerHTML = ""; hZone.classList.add('hide');
+        document.getElementById('roleDisplay').innerHTML = d.role + " (" + d.index + "號)";
+        
+        let statusHtml = "";
+        if (d.phase == 3 && d.deathNote) {
+            statusHtml += `<div class="info">${d.deathNote}</div>`;
+        }
+
+        if (d.isStarting && d.countdown > 0) {
+            document.getElementById('title').innerHTML = "遊戲即將開始";
+            area.innerHTML = `<div style="font-size: 4em; font-weight: bold;">${d.countdown}</div>`;
+            document.getElementById('status').innerHTML = ""; 
+            return;
+        } 
+        else if (d.waitingForPlayers) {
+            document.getElementById('title').innerHTML = "等待玩家加入";
+            area.innerHTML = `<div style="font-size: 3em; font-weight: bold;">${d.currentCount} / ${d.targetCount}</div>`;
+            document.getElementById('status').innerHTML = "已確認人數，等待連線...";
+            return;
+        } else {
+            document.getElementById('title').innerHTML = "遊戲大廳";
+        }
+
+        if (d.isDead) {
+            let deadStatus = d.idiotRevealed ? "你已翻牌免死 (無投票權)" : "你已出局";
+            statusHtml += (statusHtml ? "<br>" : "") + deadStatus;
+            if (d.canShoot) {
+                hZone.classList.remove('hide');
+                d.targets.forEach(t => hActions.innerHTML += `<button class="hunter" onclick="act('hunterShoot','${t.id}')">射殺 ${t.index}號</button>`);
+            }
+            document.getElementById('status').innerHTML = statusHtml;
+            if (!d.idiotRevealed) return;
+        } else {
+            document.getElementById('status').innerHTML = statusHtml;
+        }
+        
+        if (d.isPhaseLocked && !d.hunterActionPending) { area.innerHTML = "🌙 天黑請閉眼..."; return; }
+        if (d.hunterActionPending) { area.innerHTML = "等待獵人行動..."; return; }
+
+
+        if (d.phase == 4 && d.role === "守衛") {
+            d.targets.forEach(t => {
+                if(t.id != d.lastGuardedId) area.innerHTML += `<button onclick="act('guardProtect','${t.id}')">守護 ${t.index}號</button>`;
+            });
+            area.innerHTML += `<button onclick="act('guardProtect','')">空守</button>`;
+        } else if (d.phase == 0 && d.role === "狼人") {
+            d.targets.forEach(t => area.innerHTML += `<button onclick="act('wolfKill','${t.id}')">獵殺 ${t.index}號</button>`);
+        } else if (d.phase == 1 && d.role === "預言家") {
+            d.targets.forEach(t => { if(t.index != d.index) area.innerHTML += `<button onclick="act('seerCheck','${t.id}')">查驗 ${t.index}號</button>`; });
+        } else if (d.phase == 2 && d.role === "女巫") {
+            if (d.hasHeal && d.wolfTargetIndex) area.innerHTML += `<button style="background:#16a34a" onclick="act('witchHeal','${d.wolfTargetId}')">救 ${d.wolfTargetIndex}號</button>`;
+            if (d.hasPoison) d.targets.forEach(t => area.innerHTML += `<button style="background:#dc2626" onclick="act('witchPoison','${t.id}')">毒殺 ${t.index}號</button>`);
+            area.innerHTML += `<button onclick="act('witchSkip','')">跳過</button>`;
+        } else if (d.phase == 3) {
+            if (!d.idiotRevealed) {
+                d.targets.forEach(t => area.innerHTML += `<button onclick="act('champExile','${t.id}')">放逐 ${t.index}號</button>`);
+                area.innerHTML += `<button onclick="act('champExile','')">棄票</button>`;
+            } else {
+                area.innerHTML = "你已翻牌，無法參與投票";
+            }
+        }
+    }
+    function act(a, t) { ws.send(JSON.stringify({ action: a, targetId: t, deviceId: deviceId })); }
+</script></body></html>
